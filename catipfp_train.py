@@ -224,7 +224,7 @@ def train_model(model, train, valid, test,
     best_train = 10
     best_val_epoch = 0
 
-    for epoch in range(0, 51): 
+    for epoch in range(0, 20): 
         print('Epoch: {}'.format(epoch))
 
         step_cnt = 0 
@@ -263,23 +263,20 @@ def train_model(model, train, valid, test,
                     # Project E_compress[which_moat] into positive space and normalize
                     E_proj = torch.exp(model.E_compress[which_moat])
                     E_proj = E_proj / (E_proj.sum(dim=(-2, -1), keepdim=True) + EPS)
-
                     #entry['x_step'] = E_proj[1,2,0,0].item()
                     #entry['y_step'] = E_proj[1,2,0,1].item()
-
                     E_step = E_proj.clone()
-
                     A_b = model.V_compress[:, None, :, None]  # [n, 1, l, 1]
                     B_b = model.V_compress[None, :, None, :]  # [1, n, 1, l]
 
-                    for _ in range(100):
+                    for _ in range(200):
                         row_marg = E_proj.sum(dim=3, keepdim=True) 
                         E_proj.mul_(A_b / row_marg)
                         col_marg = E_proj.sum(dim=2, keepdim=True)
                         E_proj.mul_(B_b / col_marg)
                         E_proj /= E_proj.sum(dim=(-2, -1), keepdim=True) + EPS 
 
-                    #Take the KLDF here 
+                    #Take the KLD here 
                     #entry['x_proj'] = E_proj[1,2,0,0].item()
                     #entry['y_proj'] = E_proj[1,2,0,1].item()
                     model.E_compress[which_moat].copy_(torch.log(E_proj + EPS))
@@ -352,7 +349,30 @@ def train_model(model, train, valid, test,
     #out of loop, print final distribution
     print("Best_val_epoch: ", best_val_epoch, " best_val: ", best_val, "best_test: ", best_test, "best_train", best_train) 
 
+def merge_columns_and_append(x: torch.Tensor, xi: int, xj: int) -> torch.Tensor:
+    """
+    Merge two columns (xi, xj) of tensor x into a new single column y = 2*xi + xj,
+    then return tensor with xi and xj columns removed and y appended at the end.
 
+    Args:
+        x (torch.Tensor): Input tensor of shape (num_samples, num_features)
+        xi (int): Index of first column to merge
+        xj (int): Index of second column to merge
+
+    Returns:
+        torch.Tensor: Modified tensor with merged column appended, shape (num_samples, num_features - 1)
+    """
+    mask = torch.ones(x.shape[1], dtype=torch.bool)
+    mask[xi] = False
+    mask[xj] = False
+
+    x_reduced = x[:, mask]
+    x_i = x[:, xi]
+    x_j = x[:, xj]
+    y = 2 * x_i + x_j  # merge columns
+    y = y.unsqueeze(1)
+
+    return torch.cat([x_reduced, y], dim=1)
 
 def main():
     args = init()
@@ -370,13 +390,13 @@ def main():
         project="MoATexps",
         config=config,
         name=f"run_{args.dataset}",
-        tags=["imagenet", "4by4patches", "4-bits"]
+        tags=["imagenet", "4by4patches", "4-bits"],
+        mode="offline"   # <--- add this here
+
     )
 
     #gives us the dataset files
     train, valid, test = load_data2(args.dataset_path, args.dataset)
-
-    #t, v, train_load, val_load = load_data("/scratch/sophie_li/data" )
 
     print('train: {}'.format(train.x.shape))
     if valid is not None:
@@ -391,24 +411,63 @@ def main():
     if args.model == 'MoAT':
         t_data=train.x.clone()
         t_data.to(device)
-        model = MoAT(n=2, x=t_data, num_classes=2, device='cpu')
+        model = MoAT(n=2, x=t_data, num_classes=4, device='cpu')
         model.to(device)
         train_loader = DataLoader(dataset=train, batch_size=args.batch_size, shuffle=True)
         print('average ll: {}'.format(avg_ll(model, train_loader)))
-        #print('average ll: {}'.format(avg_ll(model, train_load)))
 
     if model is None:
         print("invalid model")
         exit(1)
 
+    #initial training, none compressed
     train_model(model, train=train, valid=valid, test=test,
         lr=args.lr, weight_decay=args.weight_decay,
         batch_size=args.batch_size, max_epoch=args.max_epoch,
         log_file=args.log_file, output_model_file=args.output_model_file,
         dataset_name=args.dataset)
+
+    #TODO:
+    #call the compress thing here:
+    num_merges = 4 #4 achieves better LL!!!
+    for merge_idx in range(num_merges):
+        n_bin = model.n - model.b4
+        sub_mat = model.edge_posts()[:n_bin, :n_bin]
+        max_val = sub_mat.max()
+        max_pos = sub_mat.argmax()
+        #xi = max_pos // n_bin
+        #xj = max_pos % n_bin
+        xi, xj = 0, 1
+        print(f"Max gradient edge at ({xi}, {xj}) with value {max_val.item()}")
+        model.contract_edge_b2tob4_params(xi, xj)
+        print("modifying train dataset ")
+        train.x = merge_columns_and_append(train.x, xi, xj)
+        valid.x = merge_columns_and_append(valid.x, xi, xj) if valid is not None else None
+        test.x = merge_columns_and_append(test.x, xi, xj) if test is not None else None
+
+        train_model(model, train=train, valid=valid, test=test,
+            lr=args.lr, weight_decay=args.weight_decay,
+            batch_size=args.batch_size, max_epoch=args.max_epoch,
+            log_file=args.log_file, output_model_file=args.output_model_file,
+            dataset_name=args.dataset)
+
+    '''
+    mask = torch.ones_like(edge_posts, dtype=torch.bool)
+    mask.fill_diagonal_(False)  # diagonal = False, off-diagonal = True
+
+    # Masked values: set diagonal to some large number so they are never minimum
+    masked_edge_posts = edge_posts.clone()
+    masked_edge_posts[~mask] = float('inf')  # or a large positive number
+
+    # Find min and argmin among off-diagonal elements
+    min_val = masked_edge_posts.min()
+    min_pos = masked_edge_posts.argmin()
+    '''
+
+
+    #we just call train_model with diff train.x/valid.x/test.x args, merged 
     
     wandb.finish()
-
 
 if __name__ == '__main__':
     main()

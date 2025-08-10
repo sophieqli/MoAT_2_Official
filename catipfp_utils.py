@@ -1,6 +1,95 @@
 
 #funcs 
 
+import torch 
+import numpy as np
+eps = 1e-7
+
+def ipfp_yxk(E_new, E_compress_old, i, j, V_y, num_iter=200):
+    """
+    Batched IPFP update for all (Y, X_k) pairs where Y is last index in E_new.
+    Enforces:
+      - P(Y) = V_y
+      - P(X_i, X_k) from old E_compress
+      - P(X_j, X_k) from old E_compress
+    """
+    K, n_new, _, l, _ = E_new.shape
+    y_idx = n_new - 1
+    num_pairs = n_new - 1  # variables other than Y
+
+    # 1) Extract (Y, X_k) blocks: shape (K, num_pairs, 4, l)
+    yxk = E_new[:, y_idx, :y_idx, :, :].clone()
+
+    # 2) Build targets for p(X_i, X_k) and p(X_j, X_k) from old E_compress
+    keep_idx = [idx for idx in range(E_compress_old.shape[1]) if idx not in (i, j)]
+    # targets shape (K, num_pairs, 2, l)
+    targets_xi_xk = E_compress_old[:, i, keep_idx, :2, :].clone()
+    targets_xj_xk = E_compress_old[:, j, keep_idx, :2, :].clone()
+
+    # Ensure float and normalized-ish
+    yxk = yxk.clamp(min=eps)
+    targets_xi_xk = targets_xi_xk.clamp(min=eps)
+    targets_xj_xk = targets_xj_xk.clamp(min=eps)
+    V_y = V_y.to(yxk.device).view(1, 1, 4)  # (1,1,4) for broadcasting
+
+    yxk_reshaped = yxk.reshape(K, num_pairs, 2, 2, l)  # reshape once
+    V_y_expanded = V_y.expand(K, num_pairs, 4)
+    # print("V_y_expanded.shape:", V_y_expanded.shape)
+
+    targets_xi_xk_expanded = targets_xi_xk.expand(K, num_pairs, 2, l)
+    # print("targets_xi_xk_expanded.shape:", targets_xi_xk_expanded.shape)
+
+    targets_xj_xk_expanded = targets_xj_xk.expand(K, num_pairs, 2, l)
+    # print("targets_xj_xk_expanded.shape:", targets_xj_xk_expanded.shape)
+    examples = [(0,0), (2,1), (4,0)]
+
+    #print("V_y.shape =", V_y.shape)
+    #print("targets_xi_xk.shape =", targets_xi_xk.shape)
+    #print("targets_xj_xk.shape =", targets_xj_xk.shape)
+
+    for _ in range(num_iter):
+        # Apply Constraint 2: match P(X_i, X_k)
+        p_Xi_Xk = yxk_reshaped.sum(dim=3)  # sum over Xj
+        scale_xi = targets_xi_xk / (p_Xi_Xk + eps)
+        yxk_reshaped *= scale_xi.unsqueeze(3)  # broadcast over Xj dim
+
+        # Apply Constraint 3: match P(X_j, X_k)
+        p_Xj_Xk = yxk_reshaped.sum(dim=2)  # sum over Xi
+        scale_xj = targets_xj_xk / (p_Xj_Xk + eps)
+        yxk_reshaped *= scale_xj.unsqueeze(2)  # broadcast over Xi dim
+
+        # Apply Constraint 1: match P(Y)
+        p_Y = yxk_reshaped.sum(dim=4)  # sum over Xk
+        p_Y_flat = p_Y.reshape(K, num_pairs, 4)
+        scale_Y = V_y.view(1, 1, 4) / (p_Y_flat + eps)
+        yxk_reshaped *= scale_Y.reshape(K, num_pairs, 2, 2, 1)  # broadcast over Xk dim
+
+        # Print diagnostics every 50 iterations
+        '''
+        if (_ + 1) % 50 == 0 or _ == num_iter - 1:
+            print(f"\n=== After iteration {_ + 1} ===")
+            for dist_idx, pair_idx in examples:
+                print(f"\nDistribution {dist_idx}, Pair {pair_idx}")
+
+                print("Target P(Y):", [round(x, 4) for x in V_y_expanded[dist_idx, pair_idx].tolist()])
+                print("Target P(X_i, X_k):")
+                print([[round(x, 4) for x in row] for row in targets_xi_xk_expanded[dist_idx, pair_idx].tolist()])
+                print("Target P(X_j, X_k):")
+                print([[round(x, 4) for x in row] for row in targets_xj_xk_expanded[dist_idx, pair_idx].tolist()])
+
+                print("Current P(Y):", [round(x, 4) for x in p_Y_flat[dist_idx, pair_idx].tolist()])
+                print("Current P(X_i, X_k):")
+                print([[round(x, 4) for x in row] for row in p_Xi_Xk[dist_idx, pair_idx].tolist()])
+                print("Current P(X_j, X_k):")
+                print([[round(x, 4) for x in row] for row in p_Xj_Xk[dist_idx, pair_idx].tolist()])
+        '''
+
+    yxk = yxk_reshaped.reshape(K, num_pairs, 4, l)
+
+    # write back into E_new symmetrically
+    E_new[:, y_idx, :y_idx, :, :] = yxk
+    E_new[:, :y_idx, y_idx, :, :] = yxk.transpose(2, 3)
+    return E_new
 
 def dyn_ipfpits(epoch, V_compress, E, n):
     if epoch > 25: max_iters = 300
