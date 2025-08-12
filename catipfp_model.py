@@ -24,11 +24,12 @@ class MoAT(nn.Module):
     ###     Parameter Initialization     ###
     ########################################
 
-    def __init__(self, n, x, num_classes, device='cpu', K = 1):
+    def __init__(self, n, x, num_classes, device='cuda', b4 = 0, K = 1):
         super().__init__()
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print("on device ", device)
+        self.device = device
         self.n = x.shape[1]
         if torch.isnan(x).any():
             print("Found NaNs in features (X)!")
@@ -61,15 +62,11 @@ class MoAT(nn.Module):
                         x_2d[:, :, :, l1, l2] = torch.matmul(x1l1, x2l2)
 
                 E += torch.sum(x_2d, dim=0)  # shape: [n, n, l, l]
-            #E = (E+1) / float(m + 2)
             E = (E+EPS) / float(m+EPS)
             #new init of E_compress
             E_compress = E.clone()
             E_compress = E_compress.unsqueeze(0)
             E_compress = E_compress.expand(K, -1, -1, -1, -1).clone()
-            epsilon_noise = 0.000 * torch.randn_like(E_compress) #forget the mixture idea for now
-            E_compress = E_compress + epsilon_noise
-            E_compress = torch.clamp(E_compress, min=EPS)  # avoid negative probs
             E_compress = E_compress / E_compress.sum(dim=(-2, -1), keepdim=True)
             mix_ws = torch.full((K,), 1.0 / K)
             mix_ws = torch.log(mix_ws)
@@ -110,15 +107,16 @@ class MoAT(nn.Module):
             MI = torch.special.logit(MI )
 
         # W stores the edge weights
-        self.b4 = 0
+        self.b4 = b4
         self.W = nn.Parameter(MI, requires_grad=True)
         self.K = K
         self.mix_ws = nn.Parameter(mix_ws, requires_grad = True)
         self.E_compress = nn.Parameter(E_compress, requires_grad = True)
         self.V_compress = nn.Parameter(V_compress, requires_grad=True)
+        if torch.isnan(self.V_compress).any():
+            print("Warning: NaNs detected in V_compress!")
+
         self.softmax = nn.Softmax(dim=1)  
-        print("shapes of params: ")
-        print(self.W.shape, self.E_compress.shape, self.V_compress.shape)
 
     ########################################
     ###             Inference            ###
@@ -154,7 +152,10 @@ class MoAT(nn.Module):
 
         # det(principal minor of L_0) gives the normalizing factor over the spanning trees
         L_0 = -W + torch.diag_embed(torch.sum(W, dim=1))
+        assert x.min() >= 0 and x.max() < V.shape[1], "x out of bounds for V"
 
+        if torch.isnan(V).any():
+            print("Warning: NaNs detected in V_compress! in fwd ")
         Pr = V[torch.arange(n).unsqueeze(0), x]
         assert not torch.isnan(Pr).any(), "NaN in Pr"
 
@@ -188,7 +189,36 @@ class MoAT(nn.Module):
             exit(0)
         return y
 
-    def contract_edge_b2tob4_params(self, i, j):
+    def freeze_except_Y(self):
+        if self.W.grad is None:
+            return
+        # Create a mask that is 1 for last row and last col, else 0
+        mask = torch.zeros_like(self.W.grad)
+        mask[-1, :] = 1
+        mask[:, -1] = 1
+        # Keep gradients only for last row/col
+        self.W.grad *= mask
+
+        if self.E_compress.grad is None:
+            return
+        mask = torch.zeros_like(self.E_compress.grad)
+        mask[:, -1, :, :, :] = 1  # last row
+        mask[:, :, -1, :, :] = 1  # last col
+        self.E_compress.grad *= mask
+
+        if self.V_compress.grad is None:
+            return
+        mask = torch.zeros_like(self.V_compress.grad)
+        mask[-1, :] = 1
+        self.V_compress.grad *= mask
+
+    def undo_freeze(self):
+        self.W.requires_grad = True
+        self.E_compress.requires_grad = True
+        self.V_compress.requires_grad = True
+
+
+    def contract_edge_b2tob4_params(self, i, j, trainx_ij):
         """
         Contract two binary vars X_i, X_j into a base-4 var Y = 2*X_i + X_j.
         Assumes V_compress: (n, l), E_compress: (n, n, l, l) with l=4 initially.
@@ -212,6 +242,7 @@ class MoAT(nn.Module):
         # 1. Create univariate marginals for Y directly from joint(X_i, X_j)
         joint_ij = self.E_compress[-1, i, j, :2, :2]  # shape (2, 2) since binary
         V_y = joint_ij.reshape(-1)  # flatten into length-4 vector
+
 
         # 2. Create pairwise marginals Y vs every other X_k
         E_yk_allmix = []
@@ -240,6 +271,8 @@ class MoAT(nn.Module):
                         )
                 # Renormalize
                 E_yk /= E_yk.sum() + 1e-12
+
+                #TODO: a mix of empirical and prod heuristic!!
                 E_yk_list.append(E_yk)
             E_yk_allmix.append(E_yk_list)
 
@@ -263,31 +296,58 @@ class MoAT(nn.Module):
             E_y_self = torch.zeros((4, 4), device=self.V_compress.device)
             torch.diagonal(E_y_self)[:] = V_y
 
-            print("torch cat")
-            print(E_y_col.shape, E_y_self.shape)
             # Your combined tensor currently is (n-1, l, l)
             combined = torch.cat([E_y_col, E_y_self.unsqueeze(0)], dim=0)  # shape: (n-1, l, l)
             combined = combined.unsqueeze(1)  # (n-1, 1, l, l)
             combined = combined.transpose(0, 1)  # (1, n-1, l, l)
-            print("combined shape ", combined.shape)
-            print("new mix shape ", E_new_mix.shape)
             # Now concat with E_new_mix along dim=1 (columns)
             E_new_mix = torch.cat([E_new_mix, combined], dim=0)  # final shape: (n-1, n-1, l, l)
             E_new_allmix.append(E_new_mix)
 
         E_new = torch.stack(E_new_allmix, dim=0)  # (K, n-1, n-1, l, l)
         E_new = torch.clamp(E_new, min=EPS)  # to avoid log(0) or div by 0
-        #IPFP MATCHING for joint 
-        print(" --- E_new debug  ---")
-
-        for mix in range(K):
-            print(f"\n=== Mix {mix} ===")
-            for k in range(5 - 1):  # last index is Y
-                joint_yxk = E_new[mix, -1, k, :, :]  # shape (4, l)
-                print(f"P(Y, X_{k}) shape: {joint_yxk.shape}")
-                print(joint_yxk)  # prints the actual distribution
-
         E_new_ipfp = ipfp_yxk(E_new, E_compress_old, i, j, V_y)
+
+        #get empirical distribution -> WITH Xi, Xj DELETED
+        assert trainx_ij.shape[1] == n - 1, "dataset formed wrong"
+        E_emp = torch.zeros(trainx_ij.shape[1], trainx_ij.shape[1], self.l, self.l).to(self.device)
+        m = trainx_ij.shape[0]
+
+        block_size = (2 ** 30) // (n * n * self.l * self.l)
+        for block_idx in tqdm(range(0, m, block_size)):
+            block_size_ = min(block_size, m - block_idx)
+            x_block = trainx_ij[block_idx:block_idx + block_size_]
+            x_2d = torch.zeros(block_size_, n-1, n-1, self.l, self.l).to(device)
+            x1, x2 = x_block.unsqueeze(2), x_block.unsqueeze(1)
+            for l1 in range(self.l):
+                for l2 in range(self.l):
+                    x1l1 = (x1 == l1).float()                        
+                    x2l2 = (x2 == l2).float()                        
+                    x_2d[:, :, :, l1, l2] = torch.matmul(x1l1, x2l2)
+
+            E_emp += torch.sum(x_2d, dim=0)  # shape: [n, n, l, l]
+        E_emp = (E_emp+EPS) / float(m+EPS)
+        E_emp = E_emp.unsqueeze(0) #1,n+1, n+1, l, l
+
+        #Average product heuristic IPFP with empirical 
+        E_new_ipfp[:,-1, :] = 0.0*E_new_ipfp[:,-1, : ] + 1.0*E_emp[:,-1, :]
+        E_new_ipfp[:, :-1, -1] = 0.0 * E_new_ipfp[:, :-1, -1] + 1.0 * E_emp[:, :-1, -1]
+
+        #WE NEED TO RUN IPFP HERE cuz emp doesn't match params 
+        #joint: E_new_ipfp to match V_new
+            
+        ######
+        with torch.no_grad():
+            for which_moat in range(self.K):
+                A_b, B_b = V_new[:, None, :, None], V_new[None, :, None, :]  
+                for _ in range(200):
+                    row_marg = E_new_ipfp[which_moat].sum(dim=3, keepdim=True)
+                    E_new_ipfp[which_moat].mul_(A_b / row_marg)
+                    col_marg = E_new_ipfp[which_moat].sum(dim=2, keepdim=True)
+                    E_new_ipfp[which_moat].mul_(B_b / col_marg)
+                    E_new_ipfp[which_moat] /= E_new_ipfp[which_moat].sum(dim=(-2, -1), keepdim=True) + EPS
+        ########
+
         self.E_compress = nn.Parameter(torch.log(E_new_ipfp), requires_grad = True)
         V_new = torch.clamp(V_new, min=EPS)  # to avoid log(0) or div by 0
         self.V_compress = nn.Parameter(torch.log(V_new), requires_grad = True)
@@ -301,16 +361,21 @@ class MoAT(nn.Module):
         # Add Y as last row/col
         W_new = torch.cat([W_new, Wy.unsqueeze(1)], dim=1)
         W_new = torch.cat([W_new, torch.cat([Wy, torch.tensor([0.0], device=self.W.device)]).unsqueeze(0)], dim=0)
+        '''
+        E_new = torch.maximum(E_new_ipfp, torch.ones(1, device=self.device) * EPS).to(self.device) #Pairwise joints
+        left = V_new.unsqueeze(1).unsqueeze(-1)  # shape: [n, 1, l, 1]
+        right = V_new.unsqueeze(1).unsqueeze(0)  # shape: [1, n, 1, l]
 
+        V_new = torch.maximum(left * right, torch.ones(1, device=device)* EPS).to(device)
+        W_new = torch.sum(torch.sum(E_new * torch.log(E_new.squeeze(0) / V_new), dim=-1), dim=-1) + EPS
+        '''
         W_max = (W_new.max()).unsqueeze(0).unsqueeze(0)
         if W_max >= 1: 
             W_new = W_new / (W_max)
             W_new = torch.clamp(W_new, EPS, 1-EPS)
-        W_new = torch.special.logit(W_new)
+        W_new = torch.special.logit(W_new).squeeze(0)
             
         self.W = nn.Parameter(W_new, requires_grad = True)
-        #print("new param shapes after contraction: ")
-        #print(self.E_compress.shape, self.V_compress.shape, self.W.shape)
 
         self.n -= 1
         self.b4 += 1

@@ -224,7 +224,7 @@ def train_model(model, train, valid, test,
     best_train = 10
     best_val_epoch = 0
 
-    for epoch in range(0, 20): 
+    for epoch in range(0, max_epoch): 
         print('Epoch: {}'.format(epoch))
 
         step_cnt = 0 
@@ -372,7 +372,8 @@ def merge_columns_and_append(x: torch.Tensor, xi: int, xj: int) -> torch.Tensor:
     y = 2 * x_i + x_j  # merge columns
     y = y.unsqueeze(1)
 
-    return torch.cat([x_reduced, y], dim=1)
+    #return with i,j cols and without removed 
+    return torch.cat([x, y], dim=1), torch.cat([x_reduced, y], dim=1)
 
 def main():
     args = init()
@@ -411,7 +412,7 @@ def main():
     if args.model == 'MoAT':
         t_data=train.x.clone()
         t_data.to(device)
-        model = MoAT(n=2, x=t_data, num_classes=4, device='cpu')
+        model = MoAT(n=2, x=t_data, num_classes=4, device='cpu', b4 = 10)
         model.to(device)
         train_loader = DataLoader(dataset=train, batch_size=args.batch_size, shuffle=True)
         print('average ll: {}'.format(avg_ll(model, train_loader)))
@@ -427,23 +428,40 @@ def main():
         log_file=args.log_file, output_model_file=args.output_model_file,
         dataset_name=args.dataset)
 
-    #TODO:
-    #call the compress thing here:
-    num_merges = 4 #4 achieves better LL!!!
+    # Binary compression:
+    num_merges = 4 #4 achieves better LL, nltcs!!!
     for merge_idx in range(num_merges):
         n_bin = model.n - model.b4
         sub_mat = model.edge_posts()[:n_bin, :n_bin]
         max_val = sub_mat.max()
         max_pos = sub_mat.argmax()
-        #xi = max_pos // n_bin
-        #xj = max_pos % n_bin
-        xi, xj = 0, 1
-        print(f"Max gradient edge at ({xi}, {xj}) with value {max_val.item()}")
-        model.contract_edge_b2tob4_params(xi, xj)
+        xi = max_pos // n_bin
+        xj = max_pos % n_bin
+        '''
+        #min posterior logic 
+        edge_posts = model.edge_posts()
+        mask = torch.ones_like(edge_posts, dtype=torch.bool)
+        mask.fill_diagonal_(False)  # diagonal = False, off-diagonal = True
+
+        # Masked values: set diagonal to some large number so they are never minimum
+        masked_edge_posts = edge_posts.clone()
+        masked_edge_posts[~mask] = float('inf')  # or a large positive number
+
+        # Find min and argmin among off-diagonal elements
+        sub_mat = masked_edge_posts[:n_bin, :n_bin]
+        min_val = sub_mat.min()
+        min_pos = sub_mat.argmin()
+        xi = min_pos // n_bin
+        xj = min_pos % n_bin
+        '''
+        #print(f"Max gradient edge at ({xi}, {xj}) with value {max_val.item()}")
         print("modifying train dataset ")
-        train.x = merge_columns_and_append(train.x, xi, xj)
-        valid.x = merge_columns_and_append(valid.x, xi, xj) if valid is not None else None
-        test.x = merge_columns_and_append(test.x, xi, xj) if test is not None else None
+        trainx_ij, train.x = merge_columns_and_append(train.x, xi, xj)
+        _, valid.x = merge_columns_and_append(valid.x, xi, xj) if valid is not None else None
+        _, test.x = merge_columns_and_append(test.x, xi, xj) if test is not None else None
+
+        model.contract_edge_b2tob4_params(xi, xj, train.x)
+        print(" performing merge #: ", merge_idx)
 
         train_model(model, train=train, valid=valid, test=test,
             lr=args.lr, weight_decay=args.weight_decay,
@@ -451,22 +469,6 @@ def main():
             log_file=args.log_file, output_model_file=args.output_model_file,
             dataset_name=args.dataset)
 
-    '''
-    mask = torch.ones_like(edge_posts, dtype=torch.bool)
-    mask.fill_diagonal_(False)  # diagonal = False, off-diagonal = True
-
-    # Masked values: set diagonal to some large number so they are never minimum
-    masked_edge_posts = edge_posts.clone()
-    masked_edge_posts[~mask] = float('inf')  # or a large positive number
-
-    # Find min and argmin among off-diagonal elements
-    min_val = masked_edge_posts.min()
-    min_pos = masked_edge_posts.argmin()
-    '''
-
-
-    #we just call train_model with diff train.x/valid.x/test.x args, merged 
-    
     wandb.finish()
 
 if __name__ == '__main__':
