@@ -4,7 +4,8 @@ The code is adapted from the lab's MoAT paper https://starai.cs.ucla.edu/papers/
 
 Organization of Repo: 
 Use env.yml to set up the environment for running experiments
-orig_moat: the folder containing the original binary MoAT code (in the above paper)
-catipfp_model: contains the MoAT class implementation, including initialization and forward pass 
-catipfp_train: executes the experiment, from data loading, batching, and the train loop 
+
+orig_moat: the folder containing the original binary MoAT code (in the above paper)  
+catipfp_model: contains the MoAT class implementation, including initialization and forward pass   
+catipfp_train: executes the experiment, from data loading, batching, and the train loop   
 To run: use command "bash catipfplearn.sh" 
