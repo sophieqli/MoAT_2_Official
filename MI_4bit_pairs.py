@@ -6,7 +6,7 @@ from catipfp_train import *
 from scipy.stats import entropy
 from numpy.linalg import eigvalsh
 from clust_scores import *
-
+from catipfp_utils import *
 
 dsets = [
     "nltcs", "kdd", "plants", "baudio", "jester",
@@ -16,14 +16,14 @@ dsets = [
 ]
 
 
-def pair_variables_by_max_mi(MI_matrix):
-    n = MI_matrix.shape[0]
+def pair_variables_by_scores(matrix):
+    n = matrix.shape[0]
     assert n % 2 == 0, "n must be even"
 
     G = nx.Graph()
     for i in range(n):
         for j in range(i + 1, n):
-            G.add_edge(i, j, weight=MI_matrix[i, j])
+            G.add_edge(i, j, weight=matrix[i, j])
 
     matching = nx.algorithms.matching.max_weight_matching(G, maxcardinality=True)
     return list(matching)  # list of pairs (i,j)
@@ -34,16 +34,44 @@ def pad_if_odd(x, device):
         x = torch.cat([x, zeroscol], dim=1).clone()
     return x
 
+def entscores_matrix(x_train):
+    n_vars = x_train.shape[1]
+
+    # Precompute H(Xi | Xj) for all pairs
+    H_given_Y = torch.zeros((n_vars, n_vars), dtype=torch.float32)
+    for i in range(n_vars):
+        for j in range(n_vars):
+            if i != j:
+                H_given_Y[i, j] = HXgivenY(x_train[:, i], x_train[:, j])
+
+    # Precompute H(Xi | Xj, Xk) for all triples
+    H_given_YZ = torch.zeros((n_vars, n_vars, n_vars), dtype=torch.float32)
+    for i in range(n_vars):
+        for j in range(n_vars):
+            for k in range(n_vars):
+                if i != j and i != k and j != k:
+                    H_given_YZ[i, j, k] = HXgivenYZ(x_train[:, i], x_train[:, j], x_train[:, k])
+
+    # Now compute scores matrix using only indexing
+    scores = torch.zeros((n_vars, n_vars), dtype=torch.float32)
+    for x1 in range(n_vars):
+        for x2 in range(n_vars):
+            if x1 == x2:
+                continue
+
+            mask = [xi for xi in range(n_vars) if xi != x1 and xi != x2]
+            #Hmin = torch.min(H_given_Y[mask, x1], H_given_Y[mask, x2])
+            Hplus = H_given_Y[mask, x1] + H_given_Y[mask, x2] 
+            gain = Hplus - H_given_YZ[mask, x1, x2]
+            scores[x1, x2] = gain.sum()
+
+    return scores
+
 def further_MI_analysis(mi_np):
-    #normalize 
     mi_max = mi_np.max()
     if mi_max > 0:
         mi_np /= mi_max
-
-    print(mi_np)
     n = mi_np.shape[0]
-
-
     # Sparsity / density of MI above threshold (e.g., >0.1)
     threshold = 0.1
     upper_tri_indices = np.triu_indices(n, k=1)
@@ -57,8 +85,6 @@ def further_MI_analysis(mi_np):
     hist /= hist.sum()  # normalize
     mi_entropy = entropy(hist)
     print(f"Entropy of MI histogram: {mi_entropy:.4f}")
-
-    # Average MI per variable (row mean)
     avg_mi_per_var = mi_np.mean(axis=1)
     print(f"Average MI per variable (first 10): {avg_mi_per_var[:10]}")
 
@@ -107,12 +133,8 @@ def lostMI(mi_np, pairs, ds_name):
                 mi_np[a2, b1] + mi_np[a2, b2]
             )
 
-    #intra_mi_new = sum([mi_mat4[i,j] for i in range(m) for j in range(i, m)])
-            
     print(" -> -> -> LOST MI: ", lost_tot, " INTRA_MI: ", intra_mi, " INTER_MI: ", inter_mi)
     return lost_tot, intra_mi, inter_mi
-
-
 
 def MIgroup(ds_name):
     print("operating on ", ds_name)
@@ -126,38 +148,37 @@ def MIgroup(ds_name):
     x_val = pad_if_odd(x_val, device)
     x_test = pad_if_odd(x_test, device)
 
-    #now calculate MI matrix shape (n,n)
-
     num_classes = 2
     temp_moat = MoAT(n=x_train.shape[1], x=x_train, num_classes=num_classes, device=device, K=1)
-    #mi_matrix = torch.sigmoid(temp_moat.W.detach())
     mi_matrix = temp_moat.MI_unorm.detach()
-    #print("Any NaNs in MI matrix? TEMP MOAT DETACH ", torch.isnan(temp_moat.W.detach()).any().item())
-    # print("Any NaNs in MI matrix? UGH", torch.isnan(mi_matrix).any().item())
-
     mi_np = mi_matrix.cpu().numpy()
-    #print(mi_matrix)
+    #mi_scores = compute_contraction_score_matrix(x_train, mi_np)
+
     print("starting to cluster")
     
-    clus_mat = compute_contraction_score_matrix(x_train, mi_np)
-    pairs = pair_variables_by_max_mi(clus_mat)
-    pair_scores = [compute_pair_score(mi_np, i,j) for i,j in pairs]
+    #2. edge_posts = moat_init.edge_posts()
+    #ent_scores = entscores_matrix(x_train)
+    
+    pairs = pair_variables_by_scores( mi_np )
+    #pair_scores = [compute_pair_score(mi_np, i,j) for i,j in pairs]
+    pair_scores = [mi_np[i,j] for i,j in pairs]
     print("cluster pairs ", pairs)
-    print("pair scores", pair_scores)
-
-    #NOW TAKE TOP K 
-    k = 5
+    
+    #k = (x_train.shape[1]) // 2 
+    k = 14
     top_k_indices = np.argsort(pair_scores)[-k:][::-1]
     top_k_pairs = [pairs[i] for i in top_k_indices]
     top_k_scores = [pair_scores[i] for i in top_k_indices]
     print("top k pairs ", top_k_pairs)
     print("top k scores ", top_k_scores)
 
+    #for the plants dataset 
+    #top_k_pairs = [(50, 41), (38, 31), (35, 34), (67, 3), (37, 32), (57, 13), (54, 17), (49, 21), (56, 14), (47, 23), (45, 25), (43, 27), (40, 29), (59, 11), (53, 18), (66, 4), (65, 5), (51, 20), (61, 9), (39, 30), (63, 7), (60, 10), (46, 24), (52, 19), (48, 22), (58, 12), (62, 8), (44, 26), (55, 16), (36, 33), (42, 28), (64, 6), (68, 2), (15, 0), (69, 1)][:2]
+
     print("re-ordering cols based on cluster")
-    #reordered_indices = [i for pair in pairs for i in pair]
     reordered_indices = [i for pair in top_k_pairs for i in pair]
     p_set = set(reordered_indices)
-    for i in range(mi_np.shape[0]):
+    for i in range(x_train.shape[1]):
         if i not in p_set: reordered_indices.append(i)
     print("reordered inds")
     print(reordered_indices)
@@ -179,7 +200,8 @@ def MIgroup(ds_name):
             merged = (even_bits << 1) | odd_bits
 
             remaining = x_bin[:, 2*top_k:]
-            return torch.cat([merged, remaining], dim=1)
+            #return torch.cat([merged, remaining], dim=1)
+            return torch.cat([remaining, merged], dim=1)
 
     x_trainoutput = binary_tensor_to_base4(x_trainorder, k)
     x_valoutput = binary_tensor_to_base4(x_valorder, k)
@@ -207,10 +229,8 @@ def MIgroup(ds_name):
 #Execute funct 
 #######
 #MIgroup("c20ng")
-#MIgroup("bbc")
 worse = ["plants", "baudio", "jester", "bnetflix", "tmovie", "bbc"]
 same = ["nltcs", "tretail", "kosarek", "msweb", "kdd", "book", "cr52"]
 better = ["msnbc", "accidents", "pumsb_star", "dna", "ad"]
 
-MIgroup("baudio") #39.43
-
+MIgroup("plants")

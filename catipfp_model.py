@@ -330,8 +330,8 @@ class MoAT(nn.Module):
         E_emp = E_emp.unsqueeze(0) #1,n+1, n+1, l, l
 
         #Average product heuristic IPFP with empirical 
-        E_new_ipfp[:,-1, :] = 0.0*E_new_ipfp[:,-1, : ] + 1.0*E_emp[:,-1, :]
-        E_new_ipfp[:, :-1, -1] = 0.0 * E_new_ipfp[:, :-1, -1] + 1.0 * E_emp[:, :-1, -1]
+        E_new_ipfp[:,-1, :] = 1.0*E_new_ipfp[:,-1, : ] + 0.0*E_emp[:,-1, :]
+        E_new_ipfp[:, :-1, -1] = 1.0 * E_new_ipfp[:, :-1, -1] + 0.0 * E_emp[:, :-1, -1]
 
         #WE NEED TO RUN IPFP HERE cuz emp doesn't match params 
         #joint: E_new_ipfp to match V_new
