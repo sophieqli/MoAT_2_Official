@@ -117,14 +117,25 @@ class MoAT(nn.Module):
             print("Warning: NaNs detected in V_compress!")
 
         self.softmax = nn.Softmax(dim=1)  
+        #self.alpha = nn.Parameter(
 
     ########################################
     ###             Inference            ###
     ########################################
 
-    def forward(self, x, epoch = 0, which_moat = 0, step_cnt = 1):
+    def forward(self, x, epoch = 0, which_moat = 0, step_cnt = 1, W =None, V_compress = None, E = None):
         batch_size, d = x.shape
-        n, W, V_compress, E = self.n, self.W, self.softmax(self.V_compress),torch.exp(self.E_compress[which_moat]) #convert back to raw probabilities
+        #n, W, V_compress, E = self.n, self.W, self.softmax(self.V_compress),torch.exp(self.E_compress[which_moat]) #convert back to raw probabilities
+        #if W != None: 
+        #    print("shapes of x, W, V, E", x.shape, W.shape, V_compress.shape, E.shape, n)
+        if W is None: W = self.W
+        if V_compress is None: V_compress = self.V_compress
+        if E is None: E = self.E_compress
+        n = V_compress.shape[0]
+
+
+        V_compress = self.softmax(V_compress)
+        E = torch.exp(E[which_moat])
         E = E / E.sum(dim=(-2, -1), keepdim=True)
         EPS = torch.tensor(1e-7, device=E.device) 
         
@@ -137,9 +148,10 @@ class MoAT(nn.Module):
             E.mul_(B_b / col_marg)
             E.div_(E.sum(dim=(-2, -1), keepdim=True))
 
+    
         if step_cnt % 500 == 0:
             # === Marginal Consistency Diagnostics ===
-            marg_consistency_diagnostics(V_compress, E, self.n)
+            marg_consistency_diagnostics(V_compress, E)
 
         V = V_compress.clone()
         E_mask = (1.0 - torch.diag(torch.ones(n)).unsqueeze(-1).unsqueeze(-1)).to(E.device) #broadcasts to 1, 1, n, n diag matrix (zeroes out Xi, Xi)
@@ -217,6 +229,37 @@ class MoAT(nn.Module):
         self.E_compress.requires_grad = True
         self.V_compress.requires_grad = True
 
+    def contract_and_delete(self, i,j, trainx_ij, post_prob = 0.5):
+        device = self.W.device  # infer current model device
+
+        # --- store copy of original (G\e) params ---
+        n_orig = self.n.detach().clone() if torch.is_tensor(self.n) else self.n
+        W_orig = self.W.clone().detach().to(device)
+        V_orig = self.V_compress.clone().detach().to(device)
+        E_orig = self.E_compress.clone().detach().to(device)
+
+        cur_wij = torch.sigmoid(W_orig)[i, j]
+        #TODO: try alpha init: 
+            #1 to w_ij ratio 2. relative weight ratio 
+
+        # delete edge (i,j)
+        with torch.no_grad():
+            W_orig[i, j] = W_orig[j, i] = -100.0
+
+        # --- perform contraction (this updates the live model) ---
+        self.contract_edge_b2tob4_params(i, j, trainx_ij)
+
+        # --- store originals as separate trainable params ---
+        self.n_orig = n_orig
+        self.W_orig = nn.Parameter(W_orig, requires_grad=True)
+        self.V_orig = nn.Parameter(V_orig, requires_grad=True)
+        self.E_orig = nn.Parameter(E_orig, requires_grad=True)
+        print("contracted params W, V, E: ", self.W.shape, self.V_compress.shape, self.E_compress.shape)
+        print("G\e params W, V, E: ", self.W_orig.shape, self.V_orig.shape, self.E_orig.shape)
+
+        # --- initialize alpha (mixture blending parameter) ---
+        alpha = torch.special.logit(torch.tensor(post_prob, device=device)) #alpha - weight of contracted
+        self.alpha = nn.Parameter(alpha, requires_grad=True)
 
     def contract_edge_b2tob4_params(self, i, j, trainx_ij):
         """
@@ -243,7 +286,6 @@ class MoAT(nn.Module):
         joint_ij = self.E_compress[-1, i, j, :2, :2]  # shape (2, 2) since binary
         V_y = joint_ij.reshape(-1)  # flatten into length-4 vector
 
-
         # 2. Create pairwise marginals Y vs every other X_k
         E_yk_allmix = []
         for mix in range(K):
@@ -267,7 +309,7 @@ class MoAT(nn.Module):
                         ) * self.E_compress[mix, i,j,xi,xj]
                         '''
                         E_yk[y_val, :] = (
-                            p_ik[xi, :] * p_jk[xj, :] / (p_k + 1e-12)  # avoid div by 0
+                            p_ik[xi, :] * p_jk[xj, :] / (p_k + 1e-12) 
                         )
                 # Renormalize
                 E_yk /= E_yk.sum() + 1e-12
@@ -313,11 +355,15 @@ class MoAT(nn.Module):
         E_emp = torch.zeros(trainx_ij.shape[1], trainx_ij.shape[1], self.l, self.l).to(self.device)
         m = trainx_ij.shape[0]
 
+        #TOOD: CHANGE THIS (fails when n = 500, fine till n = 294)
         block_size = (2 ** 30) // (n * n * self.l * self.l)
+        block_size =130
         for block_idx in tqdm(range(0, m, block_size)):
             block_size_ = min(block_size, m - block_idx)
             x_block = trainx_ij[block_idx:block_idx + block_size_]
             x_2d = torch.zeros(block_size_, n-1, n-1, self.l, self.l).to(device)
+
+            print("allocated x_2d ")
             x1, x2 = x_block.unsqueeze(2), x_block.unsqueeze(1)
             for l1 in range(self.l):
                 for l2 in range(self.l):
@@ -335,8 +381,6 @@ class MoAT(nn.Module):
 
         #WE NEED TO RUN IPFP HERE cuz emp doesn't match params 
         #joint: E_new_ipfp to match V_new
-            
-        ######
         with torch.no_grad():
             for which_moat in range(self.K):
                 A_b, B_b = V_new[:, None, :, None], V_new[None, :, None, :]  
@@ -346,7 +390,6 @@ class MoAT(nn.Module):
                     col_marg = E_new_ipfp[which_moat].sum(dim=2, keepdim=True)
                     E_new_ipfp[which_moat].mul_(B_b / col_marg)
                     E_new_ipfp[which_moat] /= E_new_ipfp[which_moat].sum(dim=(-2, -1), keepdim=True) + EPS
-        ########
 
         self.E_compress = nn.Parameter(torch.log(E_new_ipfp), requires_grad = True)
         V_new = torch.clamp(V_new, min=EPS)  # to avoid log(0) or div by 0
